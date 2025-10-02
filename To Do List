@@ -1,6 +1,8 @@
 Short Term
 - Icons for all boss types ready - update python script apply correct icon to remaining boss types
 - check submitted error logs
+- Simplify the install process
+    -have the lua auto detect screen resolution and directory path like the python script does.
 
 Long Term
 - add visual effect on bar depletion on a crit
