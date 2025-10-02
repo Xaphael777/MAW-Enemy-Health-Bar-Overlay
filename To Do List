@@ -1,4 +1,5 @@
 Short Term
+PRIORITY - add a linux branch of the overlay, isn't directl compatable as is
 - Icons for all boss types ready - update python script apply correct icon to remaining boss types
 - check submitted error logs
 - Simplify the install process
