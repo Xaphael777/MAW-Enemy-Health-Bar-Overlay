@@ -6,6 +6,7 @@ Short Term
 
 Long Term
 - add visual effect on bar depletion on a crit
+- improve the look of the settings GUI
 - add icons for monsters highest and lowest resistance
 - add icons for immunities
 - tie the amount of information bars diplay to party's Monster ID skill
@@ -14,4 +15,3 @@ On Hold
 - Damage over time effects [if they get implimented in game; basic code ready to plugin]
 - Heal over Time effects?
 - integrate scrolling combat log (currently in development, not working)
-- 
