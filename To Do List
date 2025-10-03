@@ -1,9 +1,11 @@
 Short Term
-PRIORITY - add a linux branch of the overlay, isn't directl compatable as is
+PRIORITY - add a linux branch of the overlay, isn't directly compatable as is
+- add an on/off toggle for ingame bound to a key
+- add setting option to only display boss HP bars
 - Icons for all boss types ready - update python script apply correct icon to remaining boss types
 - check submitted error logs
 - Simplify the install process
-    -have the lua auto detect screen resolution and directory path like the python script does.
+    - have the lua auto detect screen resolution and directory path like the python script does.
 
 Long Term
 - add visual effect on bar depletion on a crit
