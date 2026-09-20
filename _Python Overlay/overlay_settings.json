@@ -1,0 +1,27 @@
+{
+    "font_file": "DefaultFont.ttf",
+    "font_size": 18,
+    "text_color": [
+        225,
+        225,
+        225,
+        255
+    ],
+    "text_outline_width": 1,
+    "text_outline_color": [
+        0,
+        0,
+        0,
+        255
+    ],
+    "use_text_background": true,
+    "show_mouseover_only": false,
+    "base_height": 10,
+    "left_cap_width": 5,
+    "right_cap_width": 5,
+    "fill_height": 6,
+    "boss_icon_base_size": 30,
+    "close_range_threshold": 400,
+    "shorten_number_digits": 3,
+    "screen_resolution": "1920x1080"
+}
