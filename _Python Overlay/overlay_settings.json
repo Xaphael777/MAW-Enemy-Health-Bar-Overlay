@@ -1,0 +1,38 @@
+{
+    "font_file": "DefaultFont.ttf",
+    "font_size": 12,
+    "text_color": [
+        254,
+        245,
+        226,
+        255
+    ],
+    "text_outline_width": 1,
+    "text_outline_color": [
+        0,
+        0,
+        0,
+        255
+    ],
+    "show_mouseover_only": false,
+    "hide_in_menus": true,
+    "smart_anti_overlap": true,
+    "tie_to_id_monster": false,
+    "show_name_text": true,
+    "show_hp_numbers": true,
+    "show_monster_level": true,
+    "show_attack_spell_icons": true,
+    "show_debuff_icons": true,
+    "show_debuff_timers": true,
+    "show_debuff_stacks": true,
+    "show_floating_damage": true,
+    "base_height": 10,
+    "left_cap_width": 5,
+    "right_cap_width": 5,
+    "fill_height": 6,
+    "boss_icon_base_size": 30,
+    "debuff_icon_base_size": 22,
+    "close_range_threshold": 802,
+    "shorten_number_digits": 3,
+    "screen_resolution": "1920x1080"
+}
