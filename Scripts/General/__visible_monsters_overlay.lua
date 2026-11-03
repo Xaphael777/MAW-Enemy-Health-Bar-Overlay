@@ -6,32 +6,62 @@ local script_path = debug.getinfo(1, "S").source:sub(2)
 -- 2. Extract the script's directory (".../Scripts/General/")
 local script_dir = script_path:match("^(.*[/\\])")
 
--- 3. Build the relative path to visible_monsters.json and overlay_settings.json
-local file_path = script_dir .. ".." .. "\\" .. ".." .. "\\" .. "_Python Overlay" .. "\\" .. "visible_monsters.json"
-local settings_path = script_dir .. ".." .. "\\" .. ".." .. "\\" .. "_Python Overlay" .. "\\" .. "overlay_settings.json"
+-- 3. Build paths to visible_monsters.json and overlay_settings.json
+-- Supports both _Python Overlay and standalone Executable distribution folders
+local base_game_dir = script_dir .. ".." .. "\\" .. ".." .. "\\"
+local target_dirs = {
+    base_game_dir .. "_Python Overlay",
+    base_game_dir .. "Executable"
+}
 
--- 4. Grab screen res from settings app (reloaded periodically)
-local function loadScreenResolution(path)
-    local file = io.open(path, "r")
-    if not file then
-        return 1920.0, 1080.0
-    end
-
-    local content = file:read("*a")
-    file:close()
-
-    local ok, data = pcall(json.decode, content)
-    if ok and data and data.screen_resolution then
-        local w, h = data.screen_resolution:match("(%d+)x(%d+)")
-        if w and h then
-            return tonumber(w), tonumber(h)
+local function writeMonsterOutput(encoded)
+    local wroteAny = false
+    for _, dir in ipairs(target_dirs) do
+        local f = io.open(dir .. "\\visible_monsters.json", "w")
+        if f then
+            f:write(encoded)
+            f:close()
+            wroteAny = true
         end
     end
-
-    return 1920.0, 1080.0
+    return wroteAny
 end
 
-local screenWidth, screenHeight = loadScreenResolution(settings_path)
+-- 4. Grab screen res and FOV calibration from settings app (reloaded periodically)
+local fovIndoorMultiplier = 1.205
+local fovOutdoorMultiplier = 1.0
+
+local function loadOverlaySettings()
+    for _, dir in ipairs(target_dirs) do
+        local path = dir .. "\\overlay_settings.json"
+        local file = io.open(path, "r")
+        if file then
+            local content = file:read("*a")
+            file:close()
+            local ok, data = pcall(json.decode, content)
+            if ok and data then
+                local w, h = 1920.0, 1080.0
+                local fovIn, fovOut = 1.205, 1.0
+                if data.screen_resolution then
+                    local sw, sh = data.screen_resolution:match("(%d+)x(%d+)")
+                    if sw and sh then
+                        w, h = tonumber(sw) or 1920.0, tonumber(sh) or 1080.0
+                    end
+                end
+                if data.fov_scale_indoor then
+                    fovIn = tonumber(data.fov_scale_indoor) or 1.205
+                end
+                if data.fov_scale_outdoor then
+                    fovOut = tonumber(data.fov_scale_outdoor) or 1.0
+                end
+                return w, h, fovIn, fovOut
+            end
+        end
+    end
+    return 1920.0, 1080.0, 1.205, 1.0
+end
+
+local screenWidth, screenHeight, fovIndoorMultiplier, fovOutdoorMultiplier = loadOverlaySettings()
 local screenCenterX = screenWidth / 2.0
 local screenCenterY = screenHeight / 2.0
 local lastSettingsCheck = 0
@@ -41,12 +71,14 @@ local lastWriteTime = 0
 local function refreshResolutionIfNeeded(now)
     if now - lastSettingsCheck >= 2.0 then
         lastSettingsCheck = now
-        local w, h = loadScreenResolution(settings_path)
+        local w, h, fovIn, fovOut = loadOverlaySettings()
         if w ~= screenWidth or h ~= screenHeight then
             screenWidth, screenHeight = w, h
             screenCenterX = screenWidth / 2.0
             screenCenterY = screenHeight / 2.0
         end
+        fovIndoorMultiplier = fovIn
+        fovOutdoorMultiplier = fovOut
     end
 end
 
@@ -68,14 +100,21 @@ local function getRealHP(mon)
     return math.max(0, mon.HP * mult), math.max(1, mon.FullHP * mult)
 end
 
--- Visual sprite height & radius helper (accounts for sprite-to-collision height ratio, boss scale & Shrinking Ray)
--- Note: MonListBin[id].Height (typically 160) is the physics collision cylinder height (~chest level),
--- while the rendered billboard sprite extends ~1.75x higher to the top of the monster's head.
-local SPRITE_HEIGHT_FACTOR = 1.75
+-- Visual sprite height & radius helper (accounts for monster dimensions, boss scale & Shrinking Ray)
+-- Monster visual height master table calibrated relative to Bootleg Bay Cannibals (Height 168)
+local MonsterVisualHeights = _G.MonsterVisualHeights
+if not MonsterVisualHeights and dofile and AppPath then
+    pcall(function()
+        MonsterVisualHeights = dofile(AppPath .. "Scripts/General/__monster_visual_heights.lua")
+    end)
+end
+
+local SPRITE_HEIGHT_FACTOR = 1.05
 
 local function getMonsterVisualDimensions(mon)
     local bin = Game.MonListBin[mon.Id]
-    local height = ((bin and bin.Height) or mon.BodyHeight or 100) * SPRITE_HEIGHT_FACTOR
+    local baseHeight = (MonsterVisualHeights and MonsterVisualHeights[mon.Id]) or (bin and bin.Height) or mon.BodyHeight or 160
+    local height = baseHeight * SPRITE_HEIGHT_FACTOR
     local radius = (bin and bin.Radius) or mon.BodyRadius or 40
     local scale = 1.0
     if mon.NameId >= 220 and mon.NameId < 300 then
@@ -179,11 +218,99 @@ local function getActiveDebuffs(mon, monIndex)
     return active
 end
 
-local function ProjectToScreen(x, y, z, height, radius)
-    local dx, dy, dz = x - Party.X, y - Party.Y, z - Party.Z
+local function getMonsterDRInfo(mon, monIndex)
+    local isUnstoppable = (getBossSkill and getBossSkill(mon) == "Unstoppable")
+    local minuteTicks = (const and const.Minute) or 256
+    local ccWindowTicks = 10 * minuteTicks -- 10 * const.Minute (~20 seconds)
+    local drData = nil
+    local now = Game.Time
 
-    local angle = math.rad(Party.Direction * 360.0 / 2048.0)
-    local look = math.rad(Party.LookAngle * 180.0 / 1024.0)
+    -- Group 2: Mind (Fear, Charm, Berserk, Enslave)
+    -- Group 3: Stun (Paralyze, Stun)
+    local groups = {
+        { name = "Mind", id = 2 },
+        { name = "Stun", id = 3 }
+    }
+
+    for _, g in ipairs(groups) do
+        local ratio = 0
+        if getMonsterCCRatio then
+            ratio = getMonsterCCRatio(monIndex, g.id) or 0
+        end
+
+        local isImmune = (ratio >= 0.60)
+        if g.id == 3 and isUnstoppable then
+            isImmune = true
+            ratio = math.max(ratio, 1.0)
+        end
+
+        -- Check monster's CC history to find when the rolling window expires
+        local history = mapvars and mapvars.ccHistory and mapvars.ccHistory[monIndex] and mapvars.ccHistory[monIndex][g.id]
+        local latestEndTime = 0
+        if history and #history > 0 then
+            for _, entry in ipairs(history) do
+                if entry.endTime and entry.endTime > latestEndTime then
+                    latestEndTime = entry.endTime
+                end
+            end
+        end
+
+        local windowExpire = latestEndTime + ccWindowTicks
+        local isWindowActive = (latestEndTime > 0 and now < windowExpire)
+
+        if ratio >= 0.15 or isWindowActive or (g.id == 3 and isUnstoppable) then
+            local tier = 1
+            local penalty = 25
+            if isImmune then
+                tier = 4
+                penalty = 100
+            elseif ratio >= 0.45 then
+                tier = 3
+                penalty = 75
+            elseif ratio >= 0.30 then
+                tier = 2
+                penalty = 50
+            end
+
+            local remSec = 0
+            local decayRatio = 1.0
+
+            if not isUnstoppable or g.id ~= 3 then
+                local remTicks = math.max(0, windowExpire - now)
+                remSec = math.floor(((remTicks / minuteTicks) * 2.0) * 10 + 0.5) / 10.0
+                -- Smooth 20-second rolling window decay ratio:
+                decayRatio = math.max(0.0, math.min(1.0, remTicks / ccWindowTicks))
+            else
+                decayRatio = 1.0
+                remSec = 999.0
+            end
+
+            drData = drData or {}
+            drData[g.name] = {
+                Ratio = math.floor(decayRatio * 1000 + 0.5) / 1000,
+                Tier = tier,
+                Penalty = penalty,
+                Remaining = remSec,
+                Immune = isImmune
+            }
+        end
+    end
+
+    return drData
+end
+
+local function ProjectToScreen(x, y, z, height, radius)
+    local eyeLevel = (Party.LastEyeLevel and Party.LastEyeLevel > 40 and Party.LastEyeLevel < 300 and Party.LastEyeLevel) or 105
+    local dx, dy = x - Party.X, y - Party.Y
+    local dz = z - (Party.Z + eyeLevel)
+
+    local subDir = (Game and Game.PatchOptions and Game.PatchOptions.SubDirection) or 0
+    local subLook = (Game and Game.PatchOptions and Game.PatchOptions.SubLookAngle) or 0
+    local partyDir = Party.Direction + subDir / 2048.0
+    local partyLook = Party.LookAngle + subLook / 2048.0
+
+    local angle = math.rad(partyDir * 360.0 / 2048.0)
+    local look = math.rad(partyLook * 180.0 / 1024.0)
     local s = math.sin(angle)
     local c = math.cos(angle)
 
@@ -198,8 +325,12 @@ local function ProjectToScreen(x, y, z, height, radius)
     local base_vertical_offset = dz - depth * math.tan(look)
     local head_vertical_offset = base_vertical_offset + height
 
-    -- Linear perspective scale based strictly on forward depth
-    local scale = screenCenterX / depth
+    -- Linear perspective scale based on camera depth and FOV
+    -- Indoors, GrayFace patch sets IndoorFovMul = 0.81300813 in HW mode,
+    -- which scales the effective focal length by 1.0 / 0.813 ~= 1.23 (empirically ~1.205).
+    local isIndoor = (Map and Map.IndoorOrOutdoor == 1)
+    local fovMul = isIndoor and fovIndoorMultiplier or fovOutdoorMultiplier
+    local scale = (screenCenterX * fovMul) / depth
 
     local screenX = screenCenterX - (horizontal_offset * scale)
     local headY = screenCenterY - (head_vertical_offset * scale)
@@ -311,6 +442,66 @@ local function getPartyIdMonsterMastery()
     return maxM
 end
 
+local ELEMENT_SPECS = {
+    { Name = "Fire", Kind = 0 },
+    { Name = "Air", Kind = 1 },
+    { Name = "Water", Kind = 2 },
+    { Name = "Earth", Kind = 3 },
+    { Name = "Mind", Kind = 7 },
+    { Name = "Body", Kind = 8 },
+    { Name = "Light", Kind = 9 },
+    { Name = "Dark", Kind = 10 },
+}
+
+local function getMonsterResistances(mon)
+    local results = {}
+    if not mon then
+        return results
+    end
+    local txt = Game.MonstersTxt and Game.MonstersTxt[mon.Id]
+
+    local specs = {
+        { Name = "Phys", Val = (mon.Resistances and mon.Resistances[4]) or mon.PhysResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[4]) or txt.PhysResistance)) or 0 },
+        { Name = "Fire", Val = (mon.Resistances and mon.Resistances[0]) or mon.FireResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[0]) or txt.FireResistance)) or 0 },
+        { Name = "Air", Val = (mon.Resistances and mon.Resistances[1]) or mon.AirResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[1]) or txt.AirResistance)) or 0 },
+        { Name = "Water", Val = (mon.Resistances and mon.Resistances[2]) or mon.WaterResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[2]) or txt.WaterResistance)) or 0 },
+        { Name = "Earth", Val = (mon.Resistances and mon.Resistances[3]) or mon.EarthResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[3]) or txt.EarthResistance)) or 0 },
+        { Name = "Mind", Val = (mon.Resistances and mon.Resistances[7]) or mon.MindResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[7]) or txt.MindResistance)) or 0 },
+        { Name = "Body", Val = (mon.Resistances and mon.Resistances[8]) or mon.BodyResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[8]) or txt.BodyResistance)) or 0 },
+        { Name = "Light", Val = (mon.Resistances and mon.Resistances[9]) or mon.LightResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[9]) or txt.LightResistance)) or 0 },
+        { Name = "Dark", Val = (mon.Resistances and mon.Resistances[10]) or mon.DarkResistance or 0, Base = (txt and ((txt.Resistances and txt.Resistances[10]) or txt.DarkResistance)) or 0 },
+    }
+
+    for _, s in ipairs(specs) do
+        local raw = s.Val
+        local baseRaw = s.Base
+        -- In MAW, Fire resistance encodes HP scaling in thousands (raw % 1000 is actual resistance)
+        local val = (s.Name == "Fire") and (raw % 1000) or raw
+
+        -- 3-Tier resistance system:
+        -- Tier 3 (Glowing Crowned): >= 200 (75%+ dmg reduction, former 'immune')
+        -- Tier 2 (Crowned): >= 100 (50%-74% dmg reduction)
+        -- Tier 1 (Standard): >= 50 (~29%-49% dmg reduction)
+        local tier = 0
+        if val >= 200 then
+            tier = 3
+        elseif val >= 100 then
+            tier = 2
+        elseif val >= 50 then
+            tier = 1
+        end
+
+        table.insert(results, {
+            Name = s.Name,
+            Value = val,
+            Base = baseRaw,
+            Tier = tier,
+            Immune = (tier >= 3)
+        })
+    end
+    return results
+end
+
 local function buildMonsterEntry(key, mon, value_table, dist, now)
     local hp, fullHP = getRealHP(mon)
     local hp_before_hit = (value_table and value_table.hp_before_hit) or hp
@@ -356,6 +547,7 @@ local function buildMonsterEntry(key, mon, value_table, dist, now)
 
     local debuffs = getActiveDebuffs(mon, key)
     local attackTypes, spells = getMonsterAttackAndSpells(mon)
+    local drInfo = getMonsterDRInfo(mon, key)
 
     return {
         Index = key,
@@ -366,13 +558,16 @@ local function buildMonsterEntry(key, mon, value_table, dist, now)
         Distance = dist,
         ScreenX = screenX,
         ScreenY = screenY,
+        VisualHeight = math.floor(height + 0.5),
         BarSize = bSize,
         LastHitDamage = actual_damage,
         IsCrit = is_crit,
         Debuffs = debuffs,
         AttackTypes = attackTypes,
         Spells = spells,
-        RecentHits = recent_hits
+        RecentHits = recent_hits,
+        DR = drInfo,
+        Resistances = getMonsterResistances(mon)
     }
 end
 
@@ -398,6 +593,160 @@ function events.LoadMap()
     mapvars.damaged_monsters = mapvars.damaged_monsters or {}
     debuff_duration_tracker = {}
     lastMonstersOutput = {}
+    reconcileExistingPotionBuffs()
+end
+
+-- Reconcile active potion buffs from MAW tables for save compatibility
+function reconcileExistingPotionBuffs()
+    if not vars or not Party then return end
+    vars.ActivePotionBuffs = vars.ActivePotionBuffs or {}
+    local gameTime = Game.Time
+    for p = 0, Party.High do
+        local pl = Party[p]
+        local index = pl:GetIndex()
+        vars.ActivePotionBuffs[index] = vars.ActivePotionBuffs[index] or {}
+        local pBuffs = vars.ActivePotionBuffs[index]
+
+        -- Check Day of the Gods (Divine Blessing, 257)
+        if vars.mawPotionBuff and vars.mawPotionBuff[index] and vars.mawPotionBuff[index][83] and vars.mawPotionBuff[index][83] > gameTime then
+            if not pBuffs[257] then
+                pBuffs[257] = { ExpireTime = vars.mawPotionBuff[index][83], Name = Game.ItemsTxt[257].Name }
+            end
+        end
+        -- Check Day of Protection (Divine Resistance, 263)
+        if vars.mawPotionBuff and vars.mawPotionBuff[index] and vars.mawPotionBuff[index][85] and vars.mawPotionBuff[index][85] > gameTime then
+            if not pBuffs[263] then
+                pBuffs[263] = { ExpireTime = vars.mawPotionBuff[index][85], Name = Game.ItemsTxt[263].Name }
+            end
+        end
+        -- Check Paladin's Potion (251) vs Protection (231) vs Stone Skin (234)
+        if vars.mawPotionBuff and vars.mawPotionBuff[index] then
+            local expShield = vars.mawPotionBuff[index][const.Spells.Shield] or 0
+            local expStone = vars.mawPotionBuff[index][const.Spells.StoneSkin] or 0
+            if expShield > gameTime and expShield == expStone then
+                if not pBuffs[251] then
+                    pBuffs[251] = { ExpireTime = expShield, Name = Game.ItemsTxt[251].Name }
+                end
+            else
+                if expShield > gameTime and not pBuffs[231] and not pBuffs[251] then
+                    pBuffs[231] = { ExpireTime = expShield, Name = Game.ItemsTxt[231].Name }
+                end
+                if expStone > gameTime and not pBuffs[234] and not pBuffs[251] then
+                    pBuffs[234] = { ExpireTime = expStone, Name = Game.ItemsTxt[234].Name }
+                end
+            end
+        end
+        -- Check Champion's Potion (245) vs Haste (228) vs Heroism (229)
+        if vars.mawPotionBuff and vars.mawPotionBuff[index] then
+            local expHaste = vars.mawPotionBuff[index][const.Spells.Haste] or 0
+            local expHero = vars.mawPotionBuff[index][const.Spells.Heroism] or 0
+            if expHaste > gameTime and expHaste == expHero then
+                if not pBuffs[245] then
+                    pBuffs[245] = { ExpireTime = expHaste, Name = Game.ItemsTxt[245].Name }
+                end
+            else
+                if expHaste > gameTime and not pBuffs[228] and not pBuffs[245] then
+                    pBuffs[228] = { ExpireTime = expHaste, Name = Game.ItemsTxt[228].Name }
+                end
+                if expHero > gameTime and not pBuffs[229] and not pBuffs[245] then
+                    pBuffs[229] = { ExpireTime = expHero, Name = Game.ItemsTxt[229].Name }
+                end
+            end
+        end
+        -- Check Elemental Resistance (249)
+        if vars.mawPotionBuff and vars.mawPotionBuff[index] and vars.mawPotionBuff[index][3] and vars.mawPotionBuff[index][3] > gameTime then
+            if not pBuffs[249] then
+                pBuffs[249] = { ExpireTime = vars.mawPotionBuff[index][3], Name = Game.ItemsTxt[249].Name }
+            end
+        end
+        -- Check Self Resistance (250)
+        if vars.mawPotionBuff and vars.mawPotionBuff[index] and vars.mawPotionBuff[index][58] and vars.mawPotionBuff[index][58] > gameTime then
+            if not pBuffs[250] then
+                pBuffs[250] = { ExpireTime = vars.mawPotionBuff[index][58], Name = Game.ItemsTxt[250].Name }
+            end
+        end
+        -- Check Quickmind / Meditation (232)
+        if vars.bonusMeditation and vars.bonusMeditation[index] and vars.bonusMeditation[index][1] and vars.bonusMeditation[index][1] > gameTime then
+            if not pBuffs[232] then
+                pBuffs[232] = { ExpireTime = vars.bonusMeditation[index][1], Name = Game.ItemsTxt[232].Name }
+            end
+        end
+        -- Check Regeneration (233)
+        if pl.SpellBuffs[const.PlayerBuff.Regeneration] and pl.SpellBuffs[const.PlayerBuff.Regeneration].ExpireTime > gameTime then
+            if not pBuffs[233] then
+                pBuffs[233] = { ExpireTime = pl.SpellBuffs[const.PlayerBuff.Regeneration].ExpireTime, Name = Game.ItemsTxt[233].Name }
+            end
+        end
+        -- Check Magic Protection (237)
+        if vars.magicResistancePotionExpire and vars.magicResistancePotionExpire > gameTime then
+            if not pBuffs[237] then
+                pBuffs[237] = { ExpireTime = vars.magicResistancePotionExpire, Name = Game.ItemsTxt[237].Name, IsParty = true }
+            end
+        end
+    end
+end
+
+-- Active potion buff alerts helper
+local function getActivePotionBuffs()
+    reconcileExistingPotionBuffs()
+    if not Party or not vars or not vars.ActivePotionBuffs then
+        return {}
+    end
+    local gameTime = Game.Time
+    local alerts = {}
+    local seenPartyBuffs = {}
+
+    for p = 0, Party.High do
+        local pl = Party[p]
+        local pIdx = pl:GetIndex()
+        local pBuffs = vars.ActivePotionBuffs[pIdx]
+        if pBuffs then
+            local toRemove = nil
+            for potId, data in pairs(pBuffs) do
+                if type(data) == "table" and data.ExpireTime then
+                    local remTicks = data.ExpireTime - gameTime
+                    if remTicks <= 0 then
+                        toRemove = toRemove or {}
+                        table.insert(toRemove, potId)
+                    else
+                        local remSec = math.max(0, math.floor(((remTicks / 128.0) * 10 + 0.5)) / 10.0)
+                        local isParty = (data.IsParty == true)
+                        if isParty then
+                            if not seenPartyBuffs[potId] then
+                                seenPartyBuffs[potId] = true
+                                table.insert(alerts, {
+                                    Potion = data.Name or "Potion",
+                                    Player = "Party",
+                                    Remaining = remSec,
+                                    IsParty = true,
+                                    PlayerSlot = p,
+                                })
+                            end
+                        else
+                            table.insert(alerts, {
+                                Potion = data.Name or "Potion",
+                                Player = pl.Name or ("Player " .. (p + 1)),
+                                Remaining = remSec,
+                                IsParty = false,
+                                PlayerSlot = p,
+                            })
+                        end
+                    end
+                end
+            end
+            if toRemove then
+                for _, id in ipairs(toRemove) do
+                    pBuffs[id] = nil
+                end
+            end
+        end
+    end
+
+    table.sort(alerts, function(a, b)
+        return a.Remaining < b.Remaining
+    end)
+
+    return alerts
 end
 
 -- Hook that triggers when damage is calculated (runs before MawCore.Damage pipeline)
@@ -428,7 +777,7 @@ function ShowDamage(pl, damage, crit, obj, mon)
             local now = os.clock()
             mapvars.damaged_monsters = mapvars.damaged_monsters or {}
             local entry = mapvars.damaged_monsters[idx] or {}
-            entry.is_crit = not not crit
+            if crit then entry.is_crit = true elseif entry.is_crit == nil then entry.is_crit = false end
             entry.last_hit_damage = math.max(0, math.floor((damage or 0) + 0.5))
             entry.timestamp = now
             entry.hit_recorded_this_calc = true
@@ -465,6 +814,7 @@ function events.Tick()
 
     local inMenu = (Game.CurrentScreen ~= 0)
     local idMonsterMastery = getPartyIdMonsterMastery()
+    local potionBuffs = getActivePotionBuffs()
 
     if inMenu then
         local final_output = {
@@ -472,14 +822,12 @@ function events.Tick()
             InMenu = true,
             IdMonsterMastery = idMonsterMastery,
             Monsters = lastMonstersOutput,
-            TargetedMonsterIndex = nil
+            TargetedMonsterIndex = nil,
+            PotionBuffs = potionBuffs,
         }
         local ok, encoded = pcall(json.encode, final_output)
         if ok and encoded and (encoded ~= lastEncodedOutput or (now - lastWriteTime >= 0.5)) then
-            local f = io.open(file_path, "w")
-            if f then
-                f:write(encoded)
-                f:close()
+            if writeMonsterOutput(encoded) then
                 lastEncodedOutput = encoded
                 lastWriteTime = now
             end
@@ -588,20 +936,18 @@ function events.Tick()
         InMenu = false,
         IdMonsterMastery = idMonsterMastery,
         Monsters = output,
-        TargetedMonsterIndex = targeted_monster_index
+        TargetedMonsterIndex = targeted_monster_index,
+        PotionBuffs = potionBuffs,
     }
 
     local ok, encoded = pcall(json.encode, final_output)
     if ok and encoded then
         -- Only write when data changed (or every 0.5s as heartbeat) to prevent read/write flicker
         if encoded ~= lastEncodedOutput or (now - lastWriteTime >= 0.5) then
-            local f = io.open(file_path, "w")
-            if f then
-                f:write(encoded)
-                f:close()
+            if writeMonsterOutput(encoded) then
                 lastEncodedOutput = encoded
                 lastWriteTime = now
             end
         end
     end
-end
+end
